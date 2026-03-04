@@ -1,121 +1,114 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import CoolProp.CoolProp as CP
-
-
 """
-One-tank stratified thermal energy storage - Solar Salt
-Waste heat source: ~400°C inlet, ~200°C outlet target
-Model: N-node 1D energy balance (explicit Euler)
-Based on: Koffi et al. (multi-node model), MATLAB example from lecture
+Closed one-tank stratified molten salt TES with heat exchangers
+Charging : HX in top layers transfers heat FROM hot HTF TO salt
+Discharging: HX in top layers transfers heat FROM salt TO cold HTF
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 from solar_salt_properties import density, specific_heat, thermal_conductivity
+from plotting import plot_all
+
+
+
 
 # ── PARAMETERS ────────────────────────────────────────────────────────────────
-V_tank  = 5.0       # Tank volume [m3]
-H_tank  = 4.0       # Tank height [m]
-T_init  = 200.0     # Initial tank temperature [°C] - cold state
-T_in    = 400.0     # Waste heat inlet temperature [°C]
-T_amb   = 25.0      # Ambient temperature [°C]
-T_ref   = 25.0      # Reference temperature for exergy [°C]
-T_ref_K = T_ref + 273.15
+V_tank   = 5.0       # Tank volume [m3]
+H_tank   = 4.0       # Tank height [m]
+T_init   = 200.0     # Initial tank temperature [°C] - cold state
+T_HTF_chg  = 450.0   # Hot HTF inlet temperature during charging [°C]
+T_HTF_dis  = 180.0   # Cold HTF inlet temperature during discharging [°C]
+T_out_min  = 220.0   # Minimum useful HTF outlet temp during discharge [°C]
+T_amb    = 25.0      # Ambient temperature [°C]
+T_ref    = 25.0      # Reference temperature for exergy [°C]
+T_ref_K  = T_ref + 273.15
 
-N       = 10        # Number of layers (nodes)
-U_wall  = 0.5       # Heat loss coefficient tank wall [W/m2·K]
-m_dot   = 2.0       # Mass flow rate during charging [kg/s]
+N        = 10        # Number of layers
+N_HX     = 5        # Number of top layers with HX (charging from top)
+UA_HX    = 500.0     # Total UA of heat exchanger [W/K]
+UA_HX_layer = UA_HX / N_HX  # UA per layer [W/K]
+U_wall   = 0.5       # Wall heat loss coefficient [W/m2·K]
 
-# Time settings
-dt      = 60.0      # Time step [s]
-t_total = 8 * 3600  # Total simulation time [s] (8 hours)
-steps   = int(t_total / dt)
+dt         = 60.0    # Time step [s]
+t_charge   = 8 * 3600
+t_max_dis  = 8 * 3600
+steps_chg  = int(t_charge / dt)
+steps_dis  = int(t_max_dis / dt)
 
 # ── GEOMETRY ──────────────────────────────────────────────────────────────────
-D_tank  = np.sqrt(4 * V_tank / (H_tank * np.pi))
-A_cross = np.pi * D_tank**2 / 4     # Cross-sectional area [m2]
-A_wall  = np.pi * D_tank * H_tank   # Lateral wall area [m2]
-dz      = H_tank / N                # Layer height [m]
+D_tank   = np.sqrt(4 * V_tank / (H_tank * np.pi))
+A_cross  = np.pi * D_tank**2 / 4
+A_wall   = np.pi * D_tank * H_tank
+dz       = H_tank / N
 
-# ── INITIAL CONDITIONS ────────────────────────────────────────────────────────
-T = np.full((steps, N), T_init)     # Temperature matrix [steps x nodes]
-T[0, 0] = T_in                      # Top node starts at inlet temperature
+# ── SIMULATION ────────────────────────────────────────────────────────────────
+def simulate(T_start, steps, mode):
+    T = np.zeros((steps, N))
+    T[0] = T_start.copy()
+    Q_HX_total = np.zeros(steps)  # track HX heat transfer per timestep
+    stop = steps
 
-# ── MAIN SIMULATION LOOP ─────────────────────────────────────────────────────
-for i in range(steps - 1):
-    for j in range(N):
-        T_j   = T[i, j]
-        rho   = density(T_j)
-        cp    = specific_heat(T_j)
-        k     = thermal_conductivity(T_j)
-        m_lay = rho * V_tank / N    # Mass of each layer [kg]
+    for i in range(steps - 1):
+        T_new = T[i].copy()
+        Q_HX_step = 0.0
 
-        # Heat loss through wall
-        Q_loss = U_wall * (A_wall / N) * (T_j - T_amb)
+        for j in range(N):
+            T_j  = T[i, j]
+            rho  = density(T_j)
+            cp   = specific_heat(T_j)
+            k    = thermal_conductivity(T_j)
+            m_lay = rho * V_tank / N
 
-        # Conduction to adjacent layers
-        cond_top    = k * A_cross / dz * (T[i, j-1] - T_j) if j > 0   else 0.0
-        cond_bottom = k * A_cross / dz * (T[i, j+1] - T_j) if j < N-1 else 0.0
+            # Wall heat loss
+            Q_loss = U_wall * (A_wall / N) * (T_j - T_amb)
 
-        # Advection: hot fluid enters at top (node 0), flows downward
-        adv = m_dot * cp * (T_in - T_j) if j == 0 else m_dot * cp * (T[i, j-1] - T_j)
+            # Conduction between adjacent layers
+            cond_top    = k * A_cross / dz * (T[i, j-1] - T_j) if j > 0 else 0.0
+            cond_bottom = k * A_cross / dz * (T[i, j+1] - T_j) if j < N-1 else 0.0
 
-        dT = dt / (m_lay * cp) * (adv + cond_top + cond_bottom - Q_loss)
-        T[i+1, j] = T_j + dT
+            # Heat exchanger term 
+            Q_HX = 0.0
+            if mode == 'charge' and j < N_HX:
+                # HX in top layers: hot HTF heats salt
+                Q_HX = UA_HX_layer * (T_HTF_chg - T_j)
+                Q_HX_step += Q_HX
+            elif mode == 'discharge' and j < N_HX:
+                # HX in top layers: salt heats cold HTF
+                Q_HX = UA_HX_layer * (T_HTF_dis - T_j)
+                Q_HX_step += Q_HX
 
-# ── EXERGY ANALYSIS ───────────────────────────────────────────────────────────
-def exergy_layer(T_C, m_kg):
-    """Specific stored exergy in a layer [J]"""
-    T_K = T_C + 273.15
-    cp  = specific_heat(T_C)
-    return m_kg * cp * ((T_K - T_ref_K) - T_ref_K * np.log(T_K / T_ref_K))
+            dT = dt / (m_lay * cp) * (Q_HX + cond_top + cond_bottom - Q_loss)
+            T_new[j] = T_j + dT
 
-# Total stored exergy over time
-t_axis = np.arange(steps) * dt / 3600  # [hours]
-exergy_total = np.zeros(steps)
-for i in range(steps):
-    for j in range(N):
-        rho   = density(T[i, j])
-        m_lay = rho * V_tank / N
-        exergy_total[i] += exergy_layer(T[i, j], m_lay)
+        T[i+1] = T_new
+        Q_HX_total[i] = Q_HX_step
 
-# ── RESULTS ───────────────────────────────────────────────────────────────────
-os.makedirs("results", exist_ok=True)
+        # Stop discharge when HX becomes ineffective (salt too cold)
+        if mode == 'discharge' and T[i+1, 0] < T_out_min:
+            stop = i + 2
+            print(f"Discharge stopped at t={stop*dt/3600:.2f} h "
+                  f"(T_top={T[i+1,0]:.1f}°C < {T_out_min}°C)")
+            break
 
-# Plot 1: Temperature profiles in each node over time
-fig, ax = plt.subplots(figsize=(10, 5))
-for j in range(N):
-    ax.plot(t_axis, T[:, j], label=f"Layer {j+1}")
-ax.axhline(200, color="red", linestyle="--", label="T_out target (200°C)")
-ax.set_xlabel("Time [h]")
-ax.set_ylabel("Temperature [°C]")
-ax.set_title("Stratified Tank – Temperature per Layer (Solar Salt)")
-ax.legend(loc="right", fontsize=7)
-ax.grid(True)
-plt.tight_layout()
-plt.savefig("results/temperature_profiles.png", dpi=150)
-plt.show()
+    return T[:stop], stop, Q_HX_total[:stop]
 
-# Plot 2: Stored exergy over time
-fig, ax = plt.subplots(figsize=(8, 4))
-ax.plot(t_axis, exergy_total / 1e6, color="darkorange")
-ax.set_xlabel("Time [h]")
-ax.set_ylabel("Stored Exergy [MJ]")
-ax.set_title("Total Stored Exergy in Tank")
-ax.grid(True)
-plt.tight_layout()
-plt.savefig("results/exergy_stored.png", dpi=150)
-plt.show()
 
-# Save temperatures to CSV
-np.savetxt(
-    "results/temperature_matrix.csv",
-    T,
-    delimiter=",",
-    header=",".join([f"Layer_{j+1}" for j in range(N)])
-)
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    T_start = np.full(N, T_init)
 
-print(f"Simulation complete. Final avg temperature: {T[-1].mean():.1f} °C")
-print(f"Final stored exergy: {exergy_total[-1]/1e6:.2f} MJ")
+    # 1. Charging
+    print("=== CHARGING ===")
+    T_chg, steps_chg_done, Q_chg = simulate(T_start, steps_chg, 'charge')
+
+    # 2. Storage (no HX, only losses)
+    print("=== STORAGE ===")
+    T_stor, steps_stor_done, Q_stor = simulate(T_chg[-1], steps_chg, 'storage')
+
+    # 3. Discharging
+    print("=== DISCHARGING ===")
+    T_dis, steps_dis_done, Q_dis = simulate(T_stor[-1], steps_dis, 'discharge')
+
+    # 4. Plot all results
+    plot_all(T_chg, T_stor, T_dis, Q_chg, Q_dis, dt, N, H_tank, V_tank)
