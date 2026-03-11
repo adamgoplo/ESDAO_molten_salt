@@ -11,7 +11,7 @@ import os
 
 
 def plot_all(T_chg, T_stor, T_dis, Q_chg, Q_dis, dt, N, H_tank, V_tank,
-             output_dir="results"):
+             Ex_chg=None, Ex_stor=None, Ex_dis=None, output_dir="results"):
     os.makedirs(output_dir, exist_ok=True)
 
     steps_chg = T_chg.shape[0]
@@ -122,3 +122,49 @@ def plot_all(T_chg, T_stor, T_dis, Q_chg, Q_dis, dt, N, H_tank, V_tank,
     print(f"[plotting] Saved to '{output_dir}/':")
     print(f"  temp_vs_time.png | tank_geometry_profile.png | hx_power.png")
     print(f"  E_chg={E_chg:.3f} MWh  |  E_dis={E_dis:.3f} MWh  |  eta={E_dis/E_chg*100:.1f}%")
+    # ── 4. EXERGY vs TIME ─────────────────────────────────────────────────────
+    if Ex_chg is not None and Ex_stor is not None and Ex_dis is not None:
+        # Convert J → kWh
+        ex_chg_kwh  = Ex_chg  / 3.6e6
+        ex_stor_kwh = Ex_stor / 3.6e6
+        ex_dis_kwh  = Ex_dis  / 3.6e6
+
+        # Build a continuous timeline
+        t_chg_h  = np.arange(len(Ex_chg))  * dt / 3600
+        t_stor_h = np.arange(len(Ex_stor)) * dt / 3600 + t_chg_h[-1]
+        t_dis_h  = np.arange(len(Ex_dis))  * dt / 3600 + t_stor_h[-1]
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+
+        ax.plot(t_chg_h,  ex_chg_kwh,  color="tomato",       linewidth=2, label="Charging")
+        ax.plot(t_stor_h, ex_stor_kwh, color="orange",        linewidth=2, label="Storage")
+        ax.plot(t_dis_h,  ex_dis_kwh,  color="steelblue",     linewidth=2, label="Discharging")
+
+        # Shade regions
+        ax.fill_between(t_chg_h,  ex_chg_kwh,  alpha=0.15, color="tomato")
+        ax.fill_between(t_stor_h, ex_stor_kwh, alpha=0.15, color="orange")
+        ax.fill_between(t_dis_h,  ex_dis_kwh,  alpha=0.15, color="steelblue")
+
+        # Annotate key values
+        ax.annotate(f"Peak: {ex_chg_kwh[-1]:.2f} kWh",
+                    xy=(t_chg_h[-1], ex_chg_kwh[-1]),
+                    xytext=(t_chg_h[-1] - 1.5, ex_chg_kwh[-1] + 0.5),
+                    arrowprops=dict(arrowstyle="->", color="gray"), fontsize=9)
+        ax.annotate(f"End: {ex_dis_kwh[-1]:.2f} kWh",
+                    xy=(t_dis_h[-1], ex_dis_kwh[-1]),
+                    xytext=(t_dis_h[-1] - 2.0, ex_dis_kwh[-1] + 0.5),
+                    arrowprops=dict(arrowstyle="->", color="gray"), fontsize=9)
+
+        # Exergetic efficiency label
+        eta_ex = (Ex_dis[0] - Ex_dis[-1]) / (Ex_chg[-1] - Ex_chg[0]) * 100
+        ax.set_title(f"Tank Exergy Over Full Cycle   |   η_ex = {eta_ex:.1f}%",
+                    fontsize=13, fontweight="bold")
+        ax.set_xlabel("Time [h]")
+        ax.set_ylabel("Exergy stored in tank [kWh]")
+        ax.legend(loc="upper left", frameon=True)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "exergy_vs_time.png"), dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f" exergy_vs_time.png | eta_ex={eta_ex:.1f}%")
